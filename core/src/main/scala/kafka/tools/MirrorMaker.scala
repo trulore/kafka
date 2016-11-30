@@ -32,7 +32,7 @@ import kafka.message.MessageAndMetadata
 import kafka.metrics.KafkaMetricsGroup
 import kafka.serializer.DefaultDecoder
 import kafka.utils.{CommandLineUtils, CoreUtils, Logging}
-import org.apache.kafka.clients.consumer.{OffsetAndMetadata, Consumer, ConsumerRecord, KafkaConsumer}
+import org.apache.kafka.clients.consumer.{OffsetAndMetadata, Consumer, ConsumerRecord, KafkaConsumer, CommitFailedException}
 import org.apache.kafka.clients.producer.internals.ErrorLoggingCallback
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
 import org.apache.kafka.common.TopicPartition
@@ -162,7 +162,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
       val helpOpt = parser.accepts("help", "Print this message.")
 
       if (args.length == 0)
-        CommandLineUtils.printUsageAndDie(parser, "Continuously copy data between two Kafka clusters.")
+        CommandLineUtils.printUsageAndDie(parser, "Continuously copy data between two Kafka clusters. (0.10 -> 0.9 partial backport) ")
 
 
       val options = parser.parse(args: _*)
@@ -345,6 +345,13 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
           // and re-throw to break the loop
           mirrorMakerConsumer.commit()
           throw e
+
+
+        case e: CommitFailedException =>
+          warn("Failed to commit offsets because the consumer group has rebalanced and assigned partitions to " +
+            "another instance. If you see this regularly, it could indicate that you need to either increase " +
+            "the consumer's session timeout config or reduce the number of records " +
+            "handled on each iteration with max poll records config")
       }
     } else {
       info("Exiting on send failure, skip committing offsets.")
@@ -410,14 +417,15 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
         case t: Throwable =>
           fatal("Mirror maker thread failure due to ", t)
       } finally {
-        info("Flushing producer.")
-        producer.flush()
-        info("Committing consumer offsets.")
-        try {
-          commitOffsets(mirrorMakerConsumer)
-        } catch {
-          case e: WakeupException => // just ignore
+        CoreUtils.swallow {
+           info("Flushing producer.")
+           producer.flush()
+
+           // note that this commit is skipped if flush() fails which ensures that we don't lose messages
+           info("Committing consumer offsets.")
+           commitOffsets(mirrorMakerConsumer)
         }
+
         info("Shutting down consumer connectors.")
         // we do not need to call consumer.close() since the consumer has already been interrupted
         mirrorMakerConsumer.cleanup()
